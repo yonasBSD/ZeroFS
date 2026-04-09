@@ -25,6 +25,7 @@ ZeroFS makes S3 storage feel like a real filesystem. It provides **file-level ac
 - **NFS Server** - Mount as a network filesystem on any OS
 - **9P Server** - High-performance alternative with better POSIX semantics
 - **NBD Server** - Access as raw block devices for ZFS, databases, or any filesystem
+- **Web UI** - File manager, real-time monitoring, and in-browser terminal
 - **Always Encrypted** - XChaCha20-Poly1305 encryption with LZ4 or Zstd compression
 - **High Performance** - Multi-layered caching with microsecond latencies
 - **S3 Compatible** - Works with any S3-compatible storage
@@ -67,6 +68,39 @@ ZeroFS can self-host! Here's a demo showing Rust's toolchain building ZeroFS whi
 <a href="https://asciinema.org/a/728101" target="_blank"><img src="https://asciinema.org/a/728101.png" /></a>
 </p>
 
+## Web UI
+
+ZeroFS includes a web interface. Add this to your config:
+
+```toml
+[servers.webui]
+addresses = ["127.0.0.1:8080"]
+uid = 1000
+gid = 1000
+```
+
+<p align="center">
+    <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/file_manager.png" alt="ZeroFS Web UI File Manager"
+  width="700">
+  </p>
+
+The file manager talks to ZeroFS over 9P via WebSocket. Drag-and-drop uploads work, including entire folders.
+
+<p align="center">
+    <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/dashboard.png" alt="ZeroFS Web UI Dashboard"
+  width="700">
+  </p>
+
+
+The dashboard streams live stats (throughput, IOPS, storage usage, operation counters, GC) over gRPC-web.
+
+<p align="center">
+    <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/terminal.png" alt="ZeroFS Web UI Dashboard"
+  width="700">
+  </p>
+
+The terminal runs a Linux VM in the browser using [v86](https://github.com/copy/v86). Its root filesystem is the ZeroFS instance, mounted over the same 9P WebSocket.
+
 ## Architecture
 
 ```mermaid
@@ -76,12 +110,14 @@ graph TB
         NFS[NFS Client]
         P9[9P Client]
         NBD[NBD Client]
+        WEB[Web Browser]
     end
     
     subgraph "ZeroFS Core"
         NFSD[NFS Server]
         P9D[9P Server]
         NBDD[NBD Server]
+        WEBUI[Web UI]
         VFS[Virtual Filesystem]
         ENC[Encryption Manager]
         CACHE[Cache Manager]
@@ -89,6 +125,7 @@ graph TB
         NFSD --> VFS
         P9D --> VFS
         NBDD --> VFS
+        WEBUI --> VFS
         VFS --> ENC
         ENC --> CACHE
     end
@@ -106,6 +143,7 @@ graph TB
     NFS --> NFSD
     P9 --> P9D
     NBD --> NBDD
+    WEB --> WEBUI
 ```
 
 ## Quick Start
@@ -293,6 +331,9 @@ unix_socket = "/tmp/zerofs.9p.sock"  # Optional: adds Unix socket support
 [servers.nbd]
 addresses = ["127.0.0.1:10809"]
 unix_socket = "/tmp/zerofs.nbd.sock"  # Optional: adds Unix socket support
+
+[servers.webui]
+addresses = ["127.0.0.1:8080"]
 ```
 
 ### Filesystem Quotas
