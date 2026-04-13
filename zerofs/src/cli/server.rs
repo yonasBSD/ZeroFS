@@ -448,7 +448,7 @@ pub async fn build_slatedb(
             let mut builder = DbBuilder::new(db_path.clone(), object_store.clone())
                 .with_settings(settings)
                 .with_gc_runtime(runtime_handle.clone())
-                .with_sst_block_size(slatedb::SstBlockSize::Block4Kib)
+                .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
                 .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
                 .with_metrics_recorder(metrics_recorder.clone());
@@ -463,7 +463,7 @@ pub async fn build_slatedb(
                     .with_options(slatedb::config::CompactorOptions {
                         max_concurrent_compactions,
                         max_sst_size: 256 * 1024 * 1024,
-                        max_fetch_tasks: 8,
+                        max_fetch_tasks: 4,
                         ..Default::default()
                     });
 
