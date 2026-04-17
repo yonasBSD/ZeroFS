@@ -196,62 +196,6 @@ impl ZeroFS {
         Ok(fs)
     }
 
-    /// Resolve inode ID to full path components by walking parent chain
-    /// Returns Vec of path components (excluding root), in order from root to target
-    pub async fn resolve_path_components(&self, id: InodeId) -> Vec<Vec<u8>> {
-        const ROOT_INODE_ID: InodeId = 0;
-
-        if id == ROOT_INODE_ID {
-            return Vec::new();
-        }
-
-        let mut components = Vec::new();
-        let mut current_id = id;
-
-        while current_id != ROOT_INODE_ID {
-            if let Ok(inode) = self.inode_store.get(current_id).await {
-                let parent_id = match inode.parent() {
-                    Some(p) => p,
-                    None => {
-                        // Hardlinked file - use placeholder
-                        components.push(format!("<inode:{}>", current_id).into_bytes());
-                        break;
-                    }
-                };
-
-                if let Some(name) = inode.name() {
-                    components.push(name.to_vec());
-                    current_id = parent_id;
-                } else {
-                    // Name not available (shouldn't happen for non-hardlinked files)
-                    components.push(format!("<inode:{}>", current_id).into_bytes());
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        components.reverse();
-        components
-    }
-
-    /// Resolve inode ID to full path string
-    pub async fn resolve_path_lossy(&self, id: InodeId) -> String {
-        let components = self.resolve_path_components(id).await;
-        if components.is_empty() {
-            return "/".to_string();
-        }
-        format!(
-            "/{}",
-            components
-                .iter()
-                .map(|b| String::from_utf8_lossy(b).to_string())
-                .collect::<Vec<_>>()
-                .join("/")
-        )
-    }
-
     #[cfg(test)]
     pub async fn new_in_memory() -> anyhow::Result<Self> {
         use crate::block_transformer::ZeroFsBlockTransformer;
@@ -339,44 +283,6 @@ impl ZeroFS {
         Ok(false)
     }
 
-    /// Check execute permission on all parent directories leading to a file
-    ///
-    /// NOTE: This function has a known race condition - parent directory permissions
-    /// could change after we check them but before the operation completes. This is
-    /// accepted because:
-    /// - The race window is extremely small
-    /// - Fixing it would require complex multi-directory locking  
-    /// - NFS traditionally has relaxed consistency semantics
-    pub async fn check_parent_execute_permissions(
-        &self,
-        id: InodeId,
-        creds: &Credentials,
-    ) -> Result<(), FsError> {
-        if id == 0 {
-            return Ok(());
-        }
-
-        let inode = self.inode_store.get(id).await?;
-        let parent_id = inode.parent();
-
-        // If parent is None (file is hardlinked), skip parent permission checks
-        let Some(mut current_id) = parent_id else {
-            return Ok(());
-        };
-        while current_id != 0 {
-            let parent_inode = self.inode_store.get(current_id).await?;
-
-            check_access(&parent_inode, creds, AccessMode::Execute)?;
-
-            current_id = match &parent_inode {
-                Inode::Directory(d) => d.parent,
-                _ => return Err(FsError::NotDirectory),
-            };
-        }
-
-        Ok(())
-    }
-
     pub async fn write(
         &self,
         auth: &AuthContext,
@@ -393,9 +299,6 @@ impl ZeroFS {
         );
 
         let creds = Credentials::from_auth_context(auth);
-
-        // Check parent permissions before lock (also validates inode exists)
-        self.check_parent_execute_permissions(id, &creds).await?;
 
         let _guard = self.lock_manager.acquire(id).await;
         let mut inode = self.inode_store.get(id).await?;
@@ -493,15 +396,14 @@ impl ZeroFS {
                 self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-                self.tracer
-                    .emit(
-                        || self.resolve_path_lossy(id),
-                        FileOperation::Write {
-                            offset,
-                            length: data.len() as u64,
-                        },
-                    )
-                    .await;
+                self.tracer.emit(
+                    &self.inode_store,
+                    id,
+                    FileOperation::Write {
+                        offset,
+                        length: data.len() as u64,
+                    },
+                );
 
                 Ok(InodeWithId { inode: &inode, id }.into())
             }
@@ -630,16 +532,16 @@ impl ZeroFS {
                 self.global_stats.commit_update(&stats_update);
 
                 self.stats.files_created.fetch_add(1, Ordering::Relaxed);
+                self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-                self.tracer
-                    .emit(
-                        || self.resolve_path_lossy(file_id),
-                        FileOperation::Create {
-                            mode: file_inode.mode,
-                        },
-                    )
-                    .await;
+                self.tracer.emit(
+                    &self.inode_store,
+                    file_id,
+                    FileOperation::Create {
+                        mode: file_inode.mode,
+                    },
+                );
 
                 let inode = Inode::File(file_inode);
                 let file_attrs = InodeWithId {
@@ -683,19 +585,16 @@ impl ZeroFS {
 
         let creds = Credentials::from_auth_context(auth);
 
-        self.check_parent_execute_permissions(id, &creds).await?;
-
         check_access(&inode, &creds, AccessMode::Read)?;
 
         match &inode {
             Inode::File(file) => {
                 if offset >= file.size {
-                    self.tracer
-                        .emit(
-                            || self.resolve_path_lossy(id),
-                            FileOperation::Read { offset, length: 0 },
-                        )
-                        .await;
+                    self.tracer.emit(
+                        &self.inode_store,
+                        id,
+                        FileOperation::Read { offset, length: 0 },
+                    );
                     return Ok((Bytes::new(), true));
                 }
 
@@ -709,15 +608,14 @@ impl ZeroFS {
                 self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-                self.tracer
-                    .emit(
-                        || self.resolve_path_lossy(id),
-                        FileOperation::Read {
-                            offset,
-                            length: read_len,
-                        },
-                    )
-                    .await;
+                self.tracer.emit(
+                    &self.inode_store,
+                    id,
+                    FileOperation::Read {
+                        offset,
+                        length: read_len,
+                    },
+                );
 
                 Ok((result_bytes, eof))
             }
@@ -767,12 +665,14 @@ impl ZeroFS {
 
         debug!("Trim completed successfully for inode {}", id);
 
-        self.tracer
-            .emit(
-                || self.resolve_path_lossy(id),
-                FileOperation::Trim { offset, length },
-            )
-            .await;
+        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+        self.tracer.emit(
+            &self.inode_store,
+            id,
+            FileOperation::Trim { offset, length },
+        );
 
         Ok(())
     }
@@ -808,14 +708,16 @@ impl ZeroFS {
                             inode_id
                         );
 
-                        self.tracer
-                            .emit(
-                                || self.resolve_path_lossy(inode_id),
-                                FileOperation::Lookup {
-                                    filename: String::from_utf8_lossy(filename).to_string(),
-                                },
-                            )
-                            .await;
+                        self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
+                        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+                        self.tracer.emit(
+                            &self.inode_store,
+                            inode_id,
+                            FileOperation::Lookup {
+                                filename: String::from_utf8_lossy(filename).to_string(),
+                            },
+                        );
 
                         Ok(inode_id)
                     }
@@ -979,16 +881,16 @@ impl ZeroFS {
                 self.stats
                     .directories_created
                     .fetch_add(1, Ordering::Relaxed);
+                self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-                self.tracer
-                    .emit(
-                        || self.resolve_path_lossy(new_dir_id),
-                        FileOperation::Mkdir {
-                            mode: new_dir_inode.mode,
-                        },
-                    )
-                    .await;
+                self.tracer.emit(
+                    &self.inode_store,
+                    new_dir_id,
+                    FileOperation::Mkdir {
+                        mode: new_dir_inode.mode,
+                    },
+                );
 
                 let new_inode = Inode::Directory(new_dir_inode);
                 let attrs = InodeWithId {
@@ -1093,8 +995,8 @@ impl ZeroFS {
                         .map(|&i| (i, dir_entries[i].0))
                         .collect();
 
-                    let inode_futures = stream::iter(lookup_entries.into_iter()).map(
-                        |(idx, inode_id)| async move {
+                    let inode_futures =
+                        stream::iter(lookup_entries).map(|(idx, inode_id)| async move {
                             match self.inode_store.get(inode_id).await {
                                 Ok(inode) => Ok::<_, FsError>((idx, Some(inode))),
                                 Err(FsError::NotFound) => {
@@ -1106,8 +1008,7 @@ impl ZeroFS {
                                     Err(e)
                                 }
                             }
-                        },
-                    );
+                        });
 
                     let loaded_inodes: Vec<_> = inode_futures
                         .buffered(BUFFER_SIZE)
@@ -1139,14 +1040,13 @@ impl ZeroFS {
                 self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-                self.tracer
-                    .emit(
-                        || self.resolve_path_lossy(dirid),
-                        FileOperation::Readdir {
-                            count: entries.len() as u32,
-                        },
-                    )
-                    .await;
+                self.tracer.emit(
+                    &self.inode_store,
+                    dirid,
+                    FileOperation::Readdir {
+                        count: entries.len() as u32,
+                    },
+                );
 
                 Ok(ReadDirResult {
                     entries,
@@ -1278,16 +1178,16 @@ impl ZeroFS {
         self.global_stats.commit_update(&stats_update);
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
+        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-        self.tracer
-            .emit(
-                || self.resolve_path_lossy(new_id),
-                FileOperation::Symlink {
-                    target: String::from_utf8_lossy(target).to_string(),
-                },
-            )
-            .await;
+        self.tracer.emit(
+            &self.inode_store,
+            new_id,
+            FileOperation::Symlink {
+                target: String::from_utf8_lossy(target).to_string(),
+            },
+        );
 
         Ok((
             new_id,
@@ -1329,9 +1229,6 @@ impl ZeroFS {
 
         check_access(&link_dir_inode, &creds, AccessMode::Write)?;
         check_access(&link_dir_inode, &creds, AccessMode::Execute)?;
-
-        self.check_parent_execute_permissions(fileid, &creds)
-            .await?;
 
         let mut link_dir = match link_dir_inode {
             Inode::Directory(d) => d,
@@ -1438,20 +1335,20 @@ impl ZeroFS {
         fail_point!(fp::LINK_AFTER_COMMIT);
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
+        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
         // Emit event with the original file's path and new link path
         if self.tracer.has_subscribers() {
-            let file_path = self.resolve_path_lossy(fileid).await;
-            let dir_path = self.resolve_path_lossy(linkdirid).await;
-            let new_path = format!(
-                "{}/{}",
-                dir_path.trim_end_matches('/'),
-                String::from_utf8_lossy(linkname)
-            );
-            self.tracer
-                .emit(|| async { file_path }, FileOperation::Link { new_path })
-                .await;
+            let inode_store = self.inode_store.clone();
+            let tracer = self.tracer.clone();
+            let linkname = String::from_utf8_lossy(linkname).to_string();
+            tokio::spawn(async move {
+                let file_path = inode_store.resolve_path_lossy(fileid).await;
+                let dir_path = inode_store.resolve_path_lossy(linkdirid).await;
+                let new_path = format!("{}/{}", dir_path.trim_end_matches('/'), linkname);
+                tracer.emit_with_path(file_path, FileOperation::Link { new_path });
+            });
         }
 
         Ok(())
@@ -1473,8 +1370,6 @@ impl ZeroFS {
         );
         let _guard = self.lock_manager.acquire(id).await;
         let mut inode = self.inode_store.get(id).await?;
-
-        self.check_parent_execute_permissions(id, creds).await?;
 
         // For chmod (mode change), must be owner
         if matches!(setattr.mode, SetMode::Set(_)) {
@@ -1610,17 +1505,19 @@ impl ZeroFS {
                             self.global_stats.commit_update(&update);
                         }
 
-                        self.tracer
-                            .emit(
-                                || self.resolve_path_lossy(id),
-                                FileOperation::Setattr {
-                                    mode: match setattr.mode {
-                                        SetMode::Set(m) => Some(m),
-                                        SetMode::NoChange => None,
-                                    },
+                        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
+                        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+                        self.tracer.emit(
+                            &self.inode_store,
+                            id,
+                            FileOperation::Setattr {
+                                mode: match setattr.mode {
+                                    SetMode::Set(m) => Some(m),
+                                    SetMode::NoChange => None,
                                 },
-                            )
-                            .await;
+                            },
+                        );
 
                         return Ok(InodeWithId { inode: &inode, id }.into());
                     }
@@ -1900,17 +1797,18 @@ impl ZeroFS {
 
         self.write_coordinator.commit(txn).await?;
 
-        self.tracer
-            .emit(
-                || self.resolve_path_lossy(id),
-                FileOperation::Setattr {
-                    mode: match setattr.mode {
-                        SetMode::Set(m) => Some(m),
-                        SetMode::NoChange => None,
-                    },
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+        self.tracer.emit(
+            &self.inode_store,
+            id,
+            FileOperation::Setattr {
+                mode: match setattr.mode {
+                    SetMode::Set(m) => Some(m),
+                    SetMode::NoChange => None,
                 },
-            )
-            .await;
+            },
+        );
 
         Ok(InodeWithId { inode: &inode, id }.into())
     }
@@ -2040,12 +1938,15 @@ impl ZeroFS {
 
                 self.global_stats.commit_update(&stats_update);
 
-                self.tracer
-                    .emit(
-                        || self.resolve_path_lossy(special_id),
-                        FileOperation::Mknod { mode: final_mode },
-                    )
-                    .await;
+                self.stats.files_created.fetch_add(1, Ordering::Relaxed);
+                self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
+                self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+                self.tracer.emit(
+                    &self.inode_store,
+                    special_id,
+                    FileOperation::Mknod { mode: final_mode },
+                );
 
                 Ok((
                     special_id,
@@ -2109,7 +2010,7 @@ impl ZeroFS {
 
         // Capture path before deletion for tracing (inode will be gone after)
         let trace_path = if self.tracer.has_subscribers() {
-            Some(self.resolve_path_lossy(file_id).await)
+            Some(self.inode_store.resolve_path_lossy(file_id).await)
         } else {
             None
         };
@@ -2244,12 +2145,11 @@ impl ZeroFS {
                     self.global_stats.commit_update(&update);
                 }
 
+                self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
                 if let Some(path) = trace_path {
-                    self.tracer
-                        .emit(|| async { path }, FileOperation::Remove)
-                        .await;
+                    self.tracer.emit_with_path(path, FileOperation::Remove);
                 }
 
                 Ok(())
@@ -2373,7 +2273,7 @@ impl ZeroFS {
 
         // Capture old path before rename for tracing (name will change after)
         let trace_old_path = if self.tracer.has_subscribers() {
-            Some(self.resolve_path_lossy(source_inode_id).await)
+            Some(self.inode_store.resolve_path_lossy(source_inode_id).await)
         } else {
             None
         };
@@ -2691,19 +2591,19 @@ impl ZeroFS {
             }
             _ => {}
         }
+        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
         // Emit rename event with old path and new path
         if let Some(old_path) = trace_old_path {
-            let to_dir_path = self.resolve_path_lossy(to_dirid).await;
-            let new_path = format!(
-                "{}/{}",
-                to_dir_path.trim_end_matches('/'),
-                String::from_utf8_lossy(to_name)
-            );
-            self.tracer
-                .emit(|| async { old_path }, FileOperation::Rename { new_path })
-                .await;
+            let inode_store = self.inode_store.clone();
+            let tracer = self.tracer.clone();
+            let to_name = String::from_utf8_lossy(to_name).to_string();
+            tokio::spawn(async move {
+                let to_dir_path = inode_store.resolve_path_lossy(to_dirid).await;
+                let new_path = format!("{}/{}", to_dir_path.trim_end_matches('/'), to_name);
+                tracer.emit_with_path(old_path, FileOperation::Rename { new_path });
+            });
         }
 
         Ok(())
@@ -3871,93 +3771,6 @@ mod tests {
 
         let result = fs.inode_store.get(file_id).await;
         assert!(matches!(result, Err(FsError::NotFound)));
-    }
-
-    #[tokio::test]
-    async fn test_parent_directory_execute_permissions() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
-
-        let (dir_id, _) = fs
-            .mkdir(&test_creds(), 0, b"test_dir", &SetAttributes::default())
-            .await
-            .unwrap();
-
-        let (file_id, _) = fs
-            .create(
-                &test_creds(),
-                dir_id,
-                b"test.txt",
-                &SetAttributes::default(),
-            )
-            .await
-            .unwrap();
-
-        fs.write(
-            &(&test_auth()).into(),
-            file_id,
-            0,
-            &Bytes::from(b"initial data".to_vec()),
-        )
-        .await
-        .unwrap();
-
-        let no_exec_attrs = SetAttributes {
-            mode: SetMode::Set(0o644),
-            ..Default::default()
-        };
-
-        fs.setattr(&test_creds(), dir_id, &no_exec_attrs)
-            .await
-            .unwrap();
-
-        let chmod_attrs = SetAttributes {
-            mode: SetMode::Set(0o600),
-            ..Default::default()
-        };
-
-        let result = fs.setattr(&test_creds(), file_id, &chmod_attrs).await;
-        assert!(matches!(result, Err(FsError::PermissionDenied)));
-
-        let result = fs.read_file(&(&test_auth()).into(), file_id, 0, 100).await;
-        assert!(matches!(result, Err(FsError::PermissionDenied)));
-
-        let result = fs
-            .write(
-                &(&test_auth()).into(),
-                file_id,
-                0,
-                &Bytes::from(b"new data".to_vec()),
-            )
-            .await;
-        assert!(matches!(result, Err(FsError::PermissionDenied)));
-
-        let exec_attrs = SetAttributes {
-            mode: SetMode::Set(0o755),
-            ..Default::default()
-        };
-
-        fs.setattr(&test_creds(), dir_id, &exec_attrs)
-            .await
-            .unwrap();
-
-        fs.setattr(&test_creds(), file_id, &chmod_attrs)
-            .await
-            .unwrap();
-
-        let (data, _) = fs
-            .read_file(&(&test_auth()).into(), file_id, 0, 100)
-            .await
-            .unwrap();
-        assert_eq!(data.as_ref(), b"initial data");
-
-        fs.write(
-            &(&test_auth()).into(),
-            file_id,
-            0,
-            &Bytes::from(b"updated data".to_vec()),
-        )
-        .await
-        .unwrap();
     }
 
     #[tokio::test]
