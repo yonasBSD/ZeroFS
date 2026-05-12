@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
-    Spawner,
+    S3FifoConfig, Spawner,
 };
 use slatedb::admin::AdminBuilder;
 use slatedb::config::GarbageCollectorDirectoryOptions;
@@ -352,6 +352,7 @@ pub(crate) async fn build_parts_hybrid(
     HybridCacheBuilder::new()
         .with_name("zerofs-object-prefetch-parts")
         .memory(PARTS_MEMORY_BYTES)
+        .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_: &PartKey, v: &Bytes| v.len())
         .storage()
         .with_spawner(Spawner::from(foyer_handle.clone()))
@@ -485,6 +486,7 @@ pub async fn build_slatedb(
     let hybrid = HybridCacheBuilder::new()
         .with_name("zerofs-slatedb-hybrid")
         .memory(hybrid_memory_bytes)
+        .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_, v: &slatedb::db_cache::CachedEntry| v.size())
         .storage()
         .with_spawner(Spawner::from(foyer_handle.clone()))
@@ -539,6 +541,7 @@ pub async fn build_slatedb(
                 .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
                 .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_metrics_recorder(metrics_recorder.clone());
 
             if let Some(wal_store) = wal_object_store {
@@ -548,6 +551,7 @@ pub async fn build_slatedb(
             if !disable_compactor {
                 let compactor = CompactorBuilder::new(db_path, object_store)
                     .with_runtime(runtime_handle.clone())
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
                     .with_options(slatedb::config::CompactorOptions {
                         max_concurrent_compactions,
                         max_sst_size: 256 * 1024 * 1024,
@@ -569,8 +573,9 @@ pub async fn build_slatedb(
         DatabaseMode::ReadOnly => {
             info!("Opening database in read-only mode");
 
-            let mut reader_builder =
-                DbReader::builder(db_path, object_store).with_block_transformer(block_transformer);
+            let mut reader_builder = DbReader::builder(db_path, object_store)
+                .with_block_transformer(block_transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies());
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
@@ -583,7 +588,8 @@ pub async fn build_slatedb(
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_checkpoint_id(checkpoint_id)
-                .with_block_transformer(block_transformer);
+                .with_block_transformer(block_transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies());
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }

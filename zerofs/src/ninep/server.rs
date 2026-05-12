@@ -48,17 +48,29 @@ impl NinePServer {
         }
     }
 
-    fn spawn_client_handler<S>(&self, stream: S, shutdown: &CancellationToken, client_name: String)
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    fn spawn_client_handler<R, W>(
+        &self,
+        read_stream: R,
+        write_stream: W,
+        shutdown: &CancellationToken,
+        client_name: String,
+    ) where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
     {
         let filesystem = Arc::clone(&self.filesystem);
         let lock_manager = Arc::clone(&self.lock_manager);
         let client_shutdown = shutdown.child_token();
 
         spawn_named("9p-client", async move {
-            if let Err(e) =
-                handle_client_stream(stream, filesystem, lock_manager, client_shutdown).await
+            if let Err(e) = handle_client_stream(
+                read_stream,
+                write_stream,
+                filesystem,
+                lock_manager,
+                client_shutdown,
+            )
+            .await
             {
                 error!("Error handling 9P client {}: {}", client_name, e);
             }
@@ -81,7 +93,8 @@ impl NinePServer {
                             let (stream, peer_addr) = result?;
                             info!("9P client connected from {}", peer_addr);
                             stream.set_nodelay(true)?;
-                            self.spawn_client_handler(stream, &shutdown, peer_addr.to_string());
+                            let (read_half, write_half) = stream.into_split();
+                            self.spawn_client_handler(read_half, write_half, &shutdown, peer_addr.to_string());
                         }
                     }
                 }
@@ -106,7 +119,8 @@ impl NinePServer {
                         result = listener.accept() => {
                             let (stream, _) = result?;
                             info!("9P client connected via Unix socket");
-                            self.spawn_client_handler(stream, &shutdown, "unix".to_string());
+                            let (read_half, write_half) = stream.into_split();
+                            self.spawn_client_handler(read_half, write_half, &shutdown, "unix".to_string());
                         }
                     }
                 }
@@ -117,27 +131,42 @@ impl NinePServer {
     }
 }
 
-async fn handle_client_stream<S>(
-    stream: S,
+async fn handle_client_stream<R, W>(
+    read_stream: R,
+    write_stream: W,
     filesystem: Arc<ZeroFS>,
     lock_manager: Arc<FileLockManager>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     let handler = Arc::new(NinePHandler::new(filesystem, lock_manager.clone()));
     let handler_id = handler.handler_id();
 
-    let (read_stream, mut write_stream) = tokio::io::split(stream);
-
     let (tx, mut rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
 
     let writer_task = spawn_named("9p-writer", async move {
-        while let Some((tag, response_bytes)) = rx.recv().await {
-            if let Err(e) = write_stream.write_all(&response_bytes).await {
+        let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, write_stream);
+        loop {
+            let (tag, response_bytes) = match rx.recv().await {
+                Some(msg) => msg,
+                None => break,
+            };
+            if let Err(e) = writer.write_all(&response_bytes).await {
                 error!("Failed to write response for tag {}: {}", tag, e);
-                break;
+                return;
+            }
+            while let Ok((_, more)) = rx.try_recv() {
+                if let Err(e) = writer.write_all(&more).await {
+                    error!("Failed to write response: {}", e);
+                    return;
+                }
+            }
+            if let Err(e) = writer.flush().await {
+                error!("Failed to flush writer: {}", e);
+                return;
             }
         }
     });
@@ -151,13 +180,15 @@ where
     result
 }
 
-/// Tracks in-flight requests by tag, with a Notify to signal completion.
-type InflightRequests = Arc<DashMap<u16, Arc<tokio::sync::Notify>>>;
+/// Tracks in-flight requests by tag. The `Notify` is allocated lazily when a
+/// Tflush actually arrives for the tag — most requests are never flushed, so the
+/// common path stores just `None` and avoids a per-request heap allocation.
+pub(crate) type InflightRequests = Arc<DashMap<u16, Option<Arc<tokio::sync::Notify>>>>;
 
 /// Tracks the latest Tflush tag for each oldtag. Only the last flush gets a response.
 /// Per 9P spec: "should a server receive a request and then multiple flushes for that
 /// request, it need respond only to the last flush."
-type PendingFlushes = Arc<DashMap<u16, u16>>;
+pub(crate) type PendingFlushes = Arc<DashMap<u16, u16>>;
 
 /// Dispatch a single 9P frame buffer. Shared between TCP (via LengthDelimitedCodec)
 /// and WebSocket transports.
@@ -187,14 +218,10 @@ pub(crate) fn dispatch_9p_frame(
                 pending_flushes.insert(tflush.oldtag, tag);
                 Some(tflush.oldtag)
             } else {
-                None
-            };
-
-            let notify = if flush_oldtag.is_none() {
-                let notify = Arc::new(tokio::sync::Notify::new());
-                inflight.insert(tag, Arc::clone(&notify));
-                Some(notify)
-            } else {
+                // Track the in-flight tag without allocating a Notify. A Tflush
+                // handler will lazily upgrade the entry to Some(Notify) if one
+                // ever arrives for this tag.
+                inflight.insert(tag, None);
                 None
             };
 
@@ -204,12 +231,31 @@ pub(crate) fn dispatch_9p_frame(
             let pending_flushes = Arc::clone(pending_flushes);
 
             spawn_named("9p-request", async move {
-                let response = handler.handle_message(tag, body).await;
+                let response = Box::pin(handler.handle_message(tag, body)).await;
 
                 if let Some(oldtag) = flush_oldtag {
-                    if let Some(old_notify) = inflight.get(&oldtag).map(|r| Arc::clone(r.value())) {
+                    // Lazily install a Notify in the target's inflight entry.
+                    // If the entry is gone, the target already completed.
+                    let target_notify = inflight.get_mut(&oldtag).map(|mut entry| {
+                        let slot = entry.value_mut();
+                        if let Some(n) = slot.as_ref() {
+                            Arc::clone(n)
+                        } else {
+                            let n = Arc::new(tokio::sync::Notify::new());
+                            *slot = Some(Arc::clone(&n));
+                            n
+                        }
+                    });
+
+                    if let Some(notify) = target_notify {
                         debug!("Tflush: waiting for oldtag {} to complete", oldtag);
-                        old_notify.notified().await;
+                        let permit = notify.notified();
+                        tokio::pin!(permit);
+                        // Arm the waiter before any further checks so that a
+                        // concurrent notify_waiters from the target cannot be
+                        // lost; if it already fired, enable() returns Ready.
+                        permit.as_mut().enable();
+                        permit.await;
                         debug!("Tflush: oldtag {} completed", oldtag);
                     }
 
@@ -239,8 +285,9 @@ pub(crate) fn dispatch_9p_frame(
                     }
                 }
 
-                if let Some(notify) = notify {
-                    inflight.remove(&tag);
+                if flush_oldtag.is_none()
+                    && let Some((_, Some(notify))) = inflight.remove(&tag)
+                {
                     notify.notify_waiters();
                 }
             });
