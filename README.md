@@ -265,6 +265,7 @@ ZeroFS supports multiple storage backends through the `url` field in `[storage]`
 ```toml
 [storage]
 url = "s3://my-bucket/path"
+# storage_class = "..."  # Optional: provider-specific storage class for all writes; use a HOT/standard-access class
 
 [aws]
 access_key_id = "${AWS_ACCESS_KEY_ID}"
@@ -276,6 +277,14 @@ secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 ```
 
 > **Note:** ZeroFS requires conditional write (put-if-not-exists) support for fencing. AWS S3 supports this natively. For S3-compatible object stores that do not support conditional puts, set `conditional_put` to a Redis URL. ZeroFS will use Redis to coordinate conditional write operations.
+
+> **Storage class:** Set `storage_class` under `[storage]` to write all objects with a specific class/tier. The value is passed through verbatim and is honored by all three cloud backends via their own headers: S3 `x-amz-storage-class`, GCS `x-goog-storage-class`, and Azure `x-ms-access-tier`. Because it's verbatim, it must be valid for your backend — an S3 class name on Azure, for example, is rejected on the first write. Omit it to use the account/bucket default (typically `STANDARD`/`Hot`). The typical use is selecting a cheaper single-zone / reduced-redundancy *hot* class where your provider offers one.
+>
+> **Use a hot, standard-access class.** ZeroFS reads SSTs and the manifest continuously, so colder tiers are a poor fit:
+> - **Archive** tiers (S3 `GLACIER`/`DEEP_ARCHIVE`, Azure `Archive`) require a restore before read and will render the volume unusable — never use them.
+> - **Infrequent-access** tiers (S3 `STANDARD_IA`/`ONEZONE_IA`, GCS `NEARLINE`/`COLDLINE`) work but charge a per-GB retrieval fee on every read, so for ZeroFS's constant reads they usually cost *more*, not less.
+>
+> The `[wal]` section has its own `storage_class` (see below); it does not inherit the one from `[storage]`, so WAL writes stay on the default unless you set it explicitly. Server-side copies cannot carry a class and land in the bucket default.
 
 #### Microsoft Azure
 ```toml
@@ -480,7 +489,7 @@ Every `fsync` writes to the WAL, so fsync latency equals the latency of the WAL'
 url = "file:///mnt/nvme/zerofs-wal"
 ```
 
-The `[wal]` section supports its own `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` credential blocks, independent from the main storage credentials. If no `[wal]` section is present, the WAL is written to the main object store.
+The `[wal]` section supports its own `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` credential blocks, independent from the main storage credentials. It also has its own optional `storage_class` (same values as `[storage]`); since the WAL is hot, frequently-rewritten data, it is usually left on the default `STANDARD` tier. If no `[wal]` section is present, the WAL is written to the main object store.
 
 Whether you use a separate WAL store is decided at filesystem creation time. The underlying storage engine records this in its manifest, so you cannot add or remove a separate WAL store on an existing filesystem.
 
@@ -532,13 +541,34 @@ ZeroFS's on-disk block cache stores **decrypted, decompressed** SST blocks. Encr
 
 ## Mounting the Filesystem
 
-### 9P (Recommended for better performance and FSYNC POSIX semantics)
+The recommended way to mount ZeroFS is with its own client, **`zerofs mount`**. Other NFS and 9P clients also work but where `zerofs mount` is available, it's purpose-built for ZeroFS and is what we recommend.
 
-9P provides better performance and more accurate POSIX semantics, especially for fsync/commit operations. When fsync is called on 9P, ZeroFS receives a proper signal to flush data to stable storage, ensuring strong durability guarantees.
+`zerofs mount` and the kernel 9P client both talk to the 9P server, which gives more accurate POSIX semantics than NFS, especially for fsync/commit: when fsync is called over 9P, ZeroFS receives a proper signal to flush data to stable storage, ensuring strong durability guarantees. If you require strong durability, prefer a 9P-based mount over NFS (see the [durability note](#nfs) below).
 
-**Note on durability:** With NFS, ZeroFS reports writes as "stable" to the client even though they are actually unstable (buffered in memory/cache). This is done to avoid performance degradation, as otherwise each write would translate to an fsync-like operation (COMMIT in NFS terms). During testing, we expected clients to call COMMIT on FSYNC, but tested clients (macOS and Linux) don't follow this pattern. If you require strong durability guarantees, 9P is strongly recommended over NFS.
+### `zerofs mount` (Recommended)
+
+ZeroFS ships its own client, `zerofs mount`, which talks to the 9P server but runs in userspace over FUSE. Point it at a running server, local or remote:
+
+```bash
+# TCP
+zerofs mount 127.0.0.1:5564 /mnt/zerofs
+
+# Unix socket
+zerofs mount /tmp/zerofs.9p.sock /mnt/zerofs
+```
+
+`zerofs mount` reconnects on its own: it rebuilds the session in the background and holds operations until the server is reachable again, so the mount recovers without anyone touching it. It also mounts as a regular user through `fusermount3` (no root, no kernel module) and negotiates a larger message size than the kernel client's cap. It also speaks a private fast path.
+
+Like the kernel client's `access=user`, each operation runs on the server as the local user that issued it: files are owned by whoever created them and the server enforces each user's own permissions. (This assumes the client and server share a uid namespace, and the server trusts the uid it's told). Use `--access owner|root|all` to choose who may reach the mount in the first place.
+
+Writeback caching is on by default. Writes are buffered and flushed asynchronously, similar to mounting the kernel client with `cache=mmap`. Pass `--writeback false` to write through synchronously instead. Run `zerofs mount --help` for the rest (read-only and message size).
+
+### Kernel 9P client
+
+The Linux kernel also ships a 9P client that connects to the same server. It gives the same fsync/commit semantics as `zerofs mount`, but runs in the kernel (needs the `9p`/`9pnet` modules) and caps the message size. Reach for it if you'd rather not go through FUSE.
 
 #### TCP Mount (default)
+
 ```bash
 mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/9p
 ```
@@ -557,25 +587,9 @@ mount -t 9p -o trans=unix,version=9p2000.L,cache=mmap,access=user /tmp/zerofs.9p
 
 Unix sockets avoid the network stack entirely, making them ideal for local mounts where the client and ZeroFS run on the same machine.
 
-#### Mounting with `zerofs mount`
-
-The commands above use the Linux kernel's 9P client. ZeroFS also ships its own client, `zerofs mount`, which talks to the same server but runs in userspace over FUSE:
-
-```bash
-# TCP
-zerofs mount 127.0.0.1:5564 /mnt/zerofs
-
-# Unix socket
-zerofs mount /tmp/zerofs.9p.sock /mnt/zerofs
-```
-
-`zerofs mount` reconnects on its own: it rebuilds the session in the background and holds operations until the server is reachable again, so the mount recovers without anyone touching it. It also mounts as a regular user through `fusermount3` (no root, no kernel module) and negotiates a larger message size than the kernel client's cap. They also speaks a private fast path: folding each lookup into a single round trip and returning directory entries with their attributes inline which speeds up metadata-heavy work.
-
-Like the kernel client's `access=user`, each operation runs on the server as the local user that issued it — so there's no uid to configure: files are owned by whoever created them and the server enforces each user's own permissions. (This assumes the client and server share a uid namespace, and the server trusts the uid it's told, the same as 9P's `access=user` over an unauthenticated transport.) Use `--access owner|root|all` to choose who may reach the mount in the first place; `root`/`all` need `user_allow_other` in `/etc/fuse.conf` unless you mount as root.
-
-Writeback caching is on by default — writes are buffered and flushed asynchronously, similar to mounting the kernel client with `cache=mmap`. Pass `--writeback false` to write through synchronously instead. Run `zerofs mount --help` for the rest (read-only and message size).
-
 ### NFS
+
+**Note on durability:** With NFS, ZeroFS reports writes as "stable" to the client even though they are actually unstable (buffered in memory/cache). This is done to avoid performance degradation, as otherwise each write would translate to an fsync-like operation (COMMIT in NFS terms). During testing, we expected clients to call COMMIT on FSYNC, but tested clients (macOS and Linux) don't follow this pattern. If you require strong durability guarantees, a 9P-based mount (such as `zerofs mount`) is strongly recommended over NFS.
 
 #### macOS
 ```bash
